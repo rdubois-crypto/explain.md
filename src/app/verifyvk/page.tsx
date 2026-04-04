@@ -13,6 +13,10 @@ const RPC = "https://ethereum-rpc.publicnode.com";
 const TEXT_KEY = "vkHash:ERC20_approve";
 const VKEY_PATH = "/circuits/ERC20_approve/vkey.json";
 
+// Discovered layout: versionable_texts at base_slot=10, version=0
+const BASE_SLOT = 10;
+const VERSION = 0;
+
 type Step = {
   label: string;
   status: "pending" | "running" | "success" | "error";
@@ -41,7 +45,33 @@ export default function VerifyVKPage() {
     []
   );
 
-  /* ── Fetch ENS + build storage proof ─────────────────────────── */
+  /* ── Compute storage slots ──────────────────────────────────── */
+  function computeSlots(ethers: typeof import("ethers"), ensNode: string) {
+    const keyBytes = ethers.toUtf8Bytes(TEXT_KEY);
+    // Level 1: versionable_texts mapping(uint64 => ...) at BASE_SLOT
+    const s1 = ethers.keccak256(
+      ethers.AbiCoder.defaultAbiCoder().encode(
+        ["uint256", "uint256"],
+        [VERSION, BASE_SLOT]
+      )
+    );
+    // Level 2: mapping(bytes32 => ...) at s1
+    const s2 = ethers.keccak256(
+      ethers.AbiCoder.defaultAbiCoder().encode(
+        ["bytes32", "bytes32"],
+        [ensNode, s1]
+      )
+    );
+    // Level 3: mapping(string => string) — keccak256(bytes(key) || s2)
+    const s3 = ethers.keccak256(ethers.concat([keyBytes, s2]));
+    // Long string data slots
+    const dataSlot0 = ethers.keccak256(s3);
+    const dataSlot1 =
+      "0x" + (BigInt(dataSlot0) + 1n).toString(16).padStart(64, "0");
+    return { s3, dataSlot0, dataSlot1 };
+  }
+
+  /* ── Fetch ENS + build storage proof ────────────────────────── */
   const fetchAndProve = useCallback(async () => {
     setRunning(true);
     setHwResult(null);
@@ -51,14 +81,14 @@ export default function VerifyVKPage() {
       { label: "Resolve ENS name", status: "running" },
       { label: "Fetch VK hash from text record", status: "pending" },
       { label: "Compute local VK hash", status: "pending" },
-      { label: "Find storage slot", status: "pending" },
-      { label: "Fetch storage proof (eth_getProof)", status: "pending" },
+      { label: "Compute storage slots", status: "pending" },
+      { label: "Fetch storage proofs (eth_getProof)", status: "pending" },
       { label: "Serialize for Ledger", status: "pending" },
     ];
     setSteps(newSteps);
 
     try {
-      const { ethers } = await import("ethers");
+      const ethers = await import("ethers");
       const provider = new ethers.JsonRpcProvider(RPC);
 
       // Step 0: Resolve
@@ -72,10 +102,13 @@ export default function VerifyVKPage() {
       // Step 1: Fetch text record
       updateStep(1, { status: "running" });
       const onChain = await resolver.getText(TEXT_KEY);
-      if (!onChain) throw new Error(`No text record for key "${TEXT_KEY}"`);
+      if (!onChain) throw new Error(`No text record for "${TEXT_KEY}"`);
       setVkHashOnChain(onChain);
       setVkHashEditable(onChain);
-      updateStep(1, { status: "success", detail: onChain.slice(0, 24) + "..." });
+      updateStep(1, {
+        status: "success",
+        detail: `${onChain.slice(0, 24)}...`,
+      });
 
       // Step 2: Local VK hash
       updateStep(2, { status: "running" });
@@ -93,62 +126,44 @@ export default function VerifyVKPage() {
         status: lh === onChain ? "success" : "error",
         detail:
           lh === onChain
-            ? "Matches on-chain"
+            ? "Matches on-chain \u2713"
             : `Mismatch! Local: ${lh.slice(0, 16)}...`,
       });
 
-      // Step 3: Find storage slot
+      // Step 3: Compute storage slots
       updateStep(3, { status: "running" });
       const node = ethers.namehash(ensName);
-      const keyHash = ethers.keccak256(ethers.toUtf8Bytes(TEXT_KEY));
-      let foundSlot: string | null = null;
+      const { s3, dataSlot0, dataSlot1 } = computeSlots(ethers, node);
+      updateStep(3, {
+        status: "success",
+        detail: `String slot: ${s3.slice(0, 18)}... \u2192 data at ${dataSlot0.slice(0, 12)}... +1`,
+      });
 
-      for (let base = 0; base < 20; base++) {
-        const outer = ethers.keccak256(
-          ethers.AbiCoder.defaultAbiCoder().encode(
-            ["bytes32", "uint256"],
-            [node, base]
-          )
-        );
-        const inner = ethers.keccak256(
-          ethers.AbiCoder.defaultAbiCoder().encode(
-            ["bytes32", "bytes32"],
-            [keyHash, outer]
-          )
-        );
-        const raw = await provider.getStorage(resolver.address, inner);
-        if (raw !== "0x" + "00".repeat(32)) {
-          foundSlot = inner;
-          updateStep(3, {
-            status: "success",
-            detail: `base_slot=${base}, slot=${inner.slice(0, 18)}...`,
-          });
-          break;
-        }
-      }
-      if (!foundSlot) throw new Error("Storage slot not found (tried 0-19)");
-
-      // Step 4: eth_getProof
+      // Step 4: eth_getProof for both data slots
       updateStep(4, { status: "running" });
       const proof = await provider.send("eth_getProof", [
         resolver.address,
-        [foundSlot],
+        [dataSlot0, dataSlot1],
         "latest",
       ]);
       const storageHash: string = proof.storageHash;
-      const spf = proof.storageProof[0];
+      const sp0 = proof.storageProof[0];
+      const sp1 = proof.storageProof[1];
       updateStep(4, {
         status: "success",
-        detail: `${spf.proof.length} MPT nodes, storageHash=${storageHash.slice(0, 18)}...`,
+        detail: `storageHash=${storageHash.slice(0, 18)}... slot0: ${sp0.proof.length} nodes, slot1: ${sp1.proof.length} nodes`,
       });
 
-      // Step 5: Serialize
+      // Step 5: Serialize for Nano
       updateStep(5, { status: "running" });
+      const expectedHash = vkHashEditable || onChain;
       const hex = serializePayload(
         storageHash,
-        foundSlot,
-        spf.proof as string[],
-        vkHashEditable || onChain
+        dataSlot0,
+        sp0.proof as string[],
+        dataSlot1,
+        sp1.proof as string[],
+        expectedHash
       );
       setProofPayload(hex);
       updateStep(5, {
@@ -159,7 +174,9 @@ export default function VerifyVKPage() {
       const msg = e instanceof Error ? e.message : String(e);
       setSteps((s) =>
         s.map((st) =>
-          st.status === "running" ? { ...st, status: "error", detail: msg } : st
+          st.status === "running"
+            ? { ...st, status: "error", detail: msg }
+            : st
         )
       );
     } finally {
@@ -167,7 +184,7 @@ export default function VerifyVKPage() {
     }
   }, [ensName, vkHashEditable, updateStep]);
 
-  /* ── Send to Ledger ──────────────────────────────────────────── */
+  /* ── Send to Ledger ─────────────────────────────────────────── */
   const verifyOnLedger = useCallback(async () => {
     if (!proofPayload) return;
     setHwResult(null);
@@ -178,12 +195,9 @@ export default function VerifyVKPage() {
         setLedger(dev);
       }
 
-      // Rebuild payload with the editable hash (user may have changed it)
       let payload = proofPayload;
       if (vkHashEditable && vkHashEditable !== vkHashOnChain) {
-        // Replace last 32 bytes (expectedVkHash) with edited value
-        const edited = vkHashEditable.replace("0x", "").padStart(64, "0");
-        payload = payload.slice(0, -64) + edited;
+        payload = payload.slice(0, -64) + vkHashEditable.padStart(64, "0");
       }
 
       const chunks = buildChunkedAPDUs(INS_VERIFY_VK_STORAGE, payload);
@@ -224,7 +238,6 @@ export default function VerifyVKPage() {
             value={ensName}
             onChange={(e) => setEnsName(e.target.value)}
             className="flex-1 px-3 py-2 rounded border border-[var(--border)] font-mono text-sm bg-transparent"
-            placeholder="veryklear.eth"
           />
           <button
             onClick={fetchAndProve}
@@ -317,7 +330,7 @@ export default function VerifyVKPage() {
         </section>
       )}
 
-      {/* Verify on Ledger button */}
+      {/* Verify on Ledger */}
       {proofPayload && (
         <button
           onClick={verifyOnLedger}
@@ -361,41 +374,67 @@ export default function VerifyVKPage() {
             </div>
           </div>
           <p className="text-xs text-secondary mt-3">
-            The Ledger verified the Ethereum Merkle Patricia Trie storage proof
-            using Keccak-256, confirming the VK hash is authentically stored
-            on-chain in the ENS resolver contract.
+            The Ledger verified 2 Ethereum MPT storage proofs (long string split
+            across 2 slots) using Keccak-256, confirming the VK hash is
+            authentically stored on-chain in the ENS PublicResolver.
           </p>
         </section>
       )}
 
-      {/* Footer */}
       <p className="text-xs text-secondary leading-relaxed mt-8">
-        Powered by ZKNOX. The storage proof is verified entirely on the Ledger
-        Nano S+ secure element using Keccak-256 over the MPT nodes. Modify the
-        expected hash above to demonstrate that the Nano detects tampering.
+        Powered by ZKNOX. Modify the expected hash to demonstrate tamper detection.
       </p>
     </main>
   );
 }
 
-/* ── Serialization ─────────────────────────────────────────────── */
-
+/* ── Serialization ─────────────────────────────────────────────
+ * Format for Nano (INS 0x64):
+ *   storageHash(32) | nProofs(1) |
+ *     slot_0(32) | nNodes_0(1) | [nodeLen(2) | nodeData]... |
+ *     slot_1(32) | nNodes_1(1) | [nodeLen(2) | nodeData]... |
+ *   expectedHash(32)
+ *
+ * The Nano verifies both MPT proofs, extracts 32+32 bytes,
+ * interprets as hex string, converts to 32-byte hash, compares.
+ */
 function serializePayload(
   storageHash: string,
-  slot: string,
-  proofNodes: string[],
+  slot0: string,
+  proof0: string[],
+  slot1: string,
+  proof1: string[],
   expectedVkHash: string
 ): string {
   const parts: string[] = [];
+
+  // storageHash (32 bytes)
   parts.push(storageHash.replace("0x", "").padStart(64, "0"));
-  parts.push(slot.replace("0x", "").padStart(64, "0"));
-  parts.push(proofNodes.length.toString(16).padStart(2, "0"));
-  for (const nodeHex of proofNodes) {
+
+  // nProofs (1 byte) = 2
+  parts.push("02");
+
+  // Proof 0
+  parts.push(slot0.replace("0x", "").padStart(64, "0"));
+  parts.push(proof0.length.toString(16).padStart(2, "0"));
+  for (const nodeHex of proof0) {
     const data = nodeHex.replace("0x", "");
-    const len = data.length / 2;
-    parts.push(len.toString(16).padStart(4, "0"));
+    parts.push((data.length / 2).toString(16).padStart(4, "0"));
     parts.push(data);
   }
-  parts.push(expectedVkHash.replace("0x", "").padStart(64, "0"));
+
+  // Proof 1
+  parts.push(slot1.replace("0x", "").padStart(64, "0"));
+  parts.push(proof1.length.toString(16).padStart(2, "0"));
+  for (const nodeHex of proof1) {
+    const data = nodeHex.replace("0x", "");
+    parts.push((data.length / 2).toString(16).padStart(4, "0"));
+    parts.push(data);
+  }
+
+  // expectedVkHash (32 bytes) — hex string decoded to bytes
+  const hashHex = expectedVkHash.replace("0x", "").padStart(64, "0");
+  parts.push(hashHex);
+
   return parts.join("");
 }
