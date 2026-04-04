@@ -140,3 +140,8 @@ make   # fetches proof from Ethereum, compiles C verifier, runs test
 - [ZKNOX](https://zknox.com) — Post-quantum cryptography for Ethereum
 - [LFG Labs / Verity](https://github.com/lfglabs-dev/verity) — Formally verified smart contract DSL
 - Circuit compilation and clear signing architecture by Th0rgal (LFG Labs)
+- Hardware implementation (BLS12-381 pairing, Groth16/PLONK verifier, MPT proof, Ledger Nano S+ integration) by [rdubois-crypto](https://github.com/rdubois-crypto)
+
+## References
+
+- [Unlimited public computation in constrained hardware using ZK proofs — Application to ZK clear signing](https://zknox.eth.limo/posts/2026/03/13/zk_clear_signing_160326.html)
