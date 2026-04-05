@@ -1,0 +1,67 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2025 ZKNOX
+//
+// BOLOS BN modular add stretch test.
+
+#include <stdint.h>
+#include <stddef.h>
+
+#include "../sw.h"
+#include "os.h"
+#include "cx.h"
+#include "io.h"
+
+#include "zkn_errors.h"
+#include "handler_bug.h"
+
+#include "send_response.h"
+
+/*
+Fonction: cx_bn_mod_add(r, a, b, q)
+
+a=0x05a0c09156838b9828af3f1267e175e6e284c79d1b6d8ad0cd0ae0d95790336e
+b=0x0581fb4a6e4ab5a8120b8226df951e10d794d8b7705d1fb36b998eb91a4b38e5
+q=0x060c89ce5c263405370a08b6d0302b0bab3eedb83920ee0a677297dc392126f1
+r (attendu) = 0x516320d68a80d3b03b0b882774668ec0edab29c52a9bc79d131d7b638ba4562
+r (obtenu)= 0xb22bbdbc4ce41403abac139477693f7ba19a0548bcaaa8438a46f9271db6c53
+
+Diagnostic: absence de réduction modulaire, le résultat est a+b en place de (a+b)%q*/
+
+int handler_bolos_bug()
+{
+
+  ZKN_ERROR_INIT();
+
+  ZKN_CHECK(cx_bn_lock(32, 0));
+
+  uint8_t out[32];
+  uint8_t n[32] = {0x06, 0x0c, 0x89, 0xce, 0x5c, 0x26, 0x34, 0x05, 0x37, 0x0a, 0x08, 0xb6, 0xd0, 0x30, 0x2b, 0x0b, 0xab, 0x3e, 0xed, 0xb8, 0x39, 0x20, 0xee, 0x0a, 0x67, 0x72, 0x97, 0xdc, 0x39, 0x21, 0x26, 0xf1};
+  uint8_t a[32] = {
+      0x05, 0xa0, 0xc0, 0x91, 0x56, 0x83, 0x8b, 0x98,
+      0x28, 0xaf, 0x3f, 0x12, 0x67, 0xe1, 0x75, 0xe6,
+      0xe2, 0x84, 0xc7, 0x9d, 0x1b, 0x6d, 0x8a, 0xd0,
+      0xcd, 0x0a, 0xe0, 0xd9, 0x57, 0x90, 0x33, 0x6e};
+
+  uint8_t b[32] = {
+      0x05, 0x81, 0xfb, 0x4a, 0x6e, 0x4a, 0xb5, 0xa8,
+      0x12, 0x0b, 0x82, 0x26, 0xdf, 0x95, 0x1e, 0x10,
+      0xd7, 0x94, 0xd8, 0xb7, 0x70, 0x5d, 0x1f, 0xb3,
+      0x6b, 0x99, 0x8e, 0xb9, 0x1a, 0x4b, 0x38, 0xe5};
+
+  cx_bn_t bn_n;
+  cx_bn_t bn_a;
+  cx_bn_t bn_b;
+  cx_bn_t bn_r;
+
+  ZKN_CHECK(cx_bn_alloc_init(&bn_n, 32, n, 32));
+  ZKN_CHECK(cx_bn_alloc_init(&bn_a, 32, a, 32));
+  ZKN_CHECK(cx_bn_alloc_init(&bn_b, 32, b, 32));
+  ZKN_CHECK(cx_bn_alloc(&bn_r, 32));
+
+  ZKN_CHECK(cx_bn_mod_add(bn_r, bn_a, bn_b, bn_n));
+  ZKN_CHECK(cx_bn_export(bn_r, out, 32));
+
+  io_send_response_pointer(out, 32, SW_OK);
+
+  ZKN_ERROR_CLOSE_SEND();
+}
